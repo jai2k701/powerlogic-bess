@@ -57,15 +57,25 @@ PRICE_DAYS = {
     },
 }
 
-PEAK_HOURS = {6, 7, 8, 18, 19, 20, 21, 22}
-OFFPEAK_HOURS = {23, 0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15}
+# MSEDCL (Maharashtra) ToD windows — HT industrial, per SERC tariff order FY2026-27:
+# Normal 00:00–09:00 · Solar 09:00–17:00 (−15% Apr–Sep / −25% Oct–Mar) · Peak 17:00–24:00 (+20%)
+PEAK_HOURS = {17, 18, 19, 20, 21, 22, 23}
+OFFPEAK_HOURS = {9, 10, 11, 12, 13, 14, 15, 16}
+
+MSEDCL = {
+    "base_tariff": 8.44,     # ₹/kWh HT industrial energy charge
+    "peak_mult": 1.20,
+    "solar_mult_summer": 0.85,
+    "solar_mult_winter": 0.75,
+    "oa_33kv": 3.65,         # STU 0.52 + wheeling 0.81 + CSS 2.07 + green cess 0.25 ₹/kWh
+    "oa_ehv": 2.84,          # 132/220 kV: no wheeling charge
+}
 
 # Shaded x-bands on the 24-h charts: (x0, x1, fill)
 BANDS = [
-    (-0.5, 5.5, T["night"]),
-    (5.5, 8.5, T["peak"]),
-    (9.5, 15.5, T["solar"]),
-    (17.5, 22.5, T["peak"]),
+    (-0.5, 8.5, T["night"]),
+    (8.5, 16.5, T["solar"]),
+    (16.5, 23.5, T["peak"]),
 ]
 
 
@@ -94,19 +104,46 @@ def run_dispatch(inp: dict, prices: list) -> dict:
     def landed_at(h):
         return prices[h] + oa
 
-    charge_budget = (cycles * E) / P
-    disch_budget = (cycles * E * eff) / P
-
-    by_cheap = sorted(range(24), key=landed_at)
-    by_value = sorted(range(24), key=tariff_at, reverse=True)
-
-    charge_set = set(by_cheap[: math.ceil(charge_budget) + 1])
-    disch_set = set()
-    for h in by_value:
-        if len(disch_set) >= math.ceil(disch_budget) + 1:
-            break
-        if h not in charge_set:
-            disch_set.add(h)
+    # Plan by marginal economics: pair the cheapest charge hours with the
+    # richest discharge hours, and stop when the next pair loses money
+    # (eff × avoided tariff must beat the landed charge cost) or the daily
+    # throughput budget (cycles × E) is spent. Quantities in MWh-charged.
+    charge_order = sorted(range(24), key=landed_at)
+    disch_order = sorted(range(24), key=tariff_at, reverse=True)
+    plan_c: dict[int, float] = {}
+    plan_d: dict[int, float] = {}
+    ci = di = 0
+    room_c = room_d = P
+    charged_plan = 0.0
+    throughput = cycles * E
+    while ci < 24 and di < 24 and charged_plan < throughput - 1e-9:
+        hc, hd = charge_order[ci], disch_order[di]
+        if hc == hd or hd in plan_c:
+            di += 1
+            room_d = P
+            continue
+        if hc in plan_d:
+            ci += 1
+            room_c = P
+            continue
+        if hc >= hd:  # day starts empty: charging must precede the discharge it serves
+            di += 1
+            room_d = P
+            continue
+        if tariff_at(hd) * eff <= landed_at(hc):
+            break  # marginal pair unprofitable
+        de = min(room_c, room_d / eff, throughput - charged_plan)
+        plan_c[hc] = plan_c.get(hc, 0.0) + de
+        plan_d[hd] = plan_d.get(hd, 0.0) + de * eff
+        charged_plan += de
+        room_c -= de
+        room_d -= de * eff
+        if room_c < 1e-9:
+            ci += 1
+            room_c = P
+        if room_d < 1e-9:
+            di += 1
+            room_d = P
 
     soc = 0.0
     charged_today = 0.0
@@ -116,13 +153,13 @@ def run_dispatch(inp: dict, prices: list) -> dict:
 
     for h in range(24):
         c_mw = d_mw = 0.0
-        if h in charge_set and soc < E - 1e-9 and charged_today < cycles * E - 1e-9:
-            c_mw = min(P, E - soc, cycles * E - charged_today)
+        if h in plan_c and soc < E - 1e-9:
+            c_mw = min(plan_c[h], E - soc)
             soc += c_mw
             charged_today += c_mw
             charge_cost += c_mw * 1000 * landed_at(h) / 1e5
-        elif h in disch_set and soc > 1e-9:
-            d_mw = min(P, soc * eff)
+        elif h in plan_d and soc > 1e-9:
+            d_mw = min(plan_d[h], soc * eff)
             soc -= d_mw / eff
             avoided += d_mw * 1000 * tariff_at(h) / 1e5
         rows.append({
@@ -219,6 +256,186 @@ BASE_LAYOUT = dict(
 
 
 # ------------------------------------------------------------------
+# Module 0 — BESS sizing (MSEDCL peak replacement)
+# ------------------------------------------------------------------
+def size_bess(loads, contract, coverage, rte_frac, dod_frac, margin_frac):
+    """Size a BESS to serve `coverage` of peak-window load, checking that the
+    non-peak contract-demand headroom can actually recharge it."""
+    served = {h: min(loads[h], contract) * coverage for h in PEAK_HOURS}
+    p_req = max(served.values()) if served else 0.0
+    e_usable = sum(served.values())
+    e_nameplate = e_usable / dod_frac / (1 - margin_frac) if e_usable else 0.0
+    recharge_need = e_usable / rte_frac
+    recharge_avail = sum(
+        min(max(0.0, contract - loads[h]), p_req)
+        for h in range(24) if h not in PEAK_HOURS
+    )
+    return {
+        "served": served, "p_req": p_req, "e_usable": e_usable,
+        "e_nameplate": e_nameplate, "recharge_need": recharge_need,
+        "recharge_avail": recharge_avail,
+        "feasible": recharge_need <= recharge_avail + 1e-9,
+    }
+
+
+def max_feasible_coverage(loads, contract, rte_frac, dod_frac, margin_frac):
+    for c in range(100, 0, -1):
+        if size_bess(loads, contract, c / 100, rte_frac, dod_frac, margin_frac)["feasible"]:
+            return c / 100
+    return 0.0
+
+
+def plan_charge(loads, contract, p_bess, need, prices, oa):
+    """Allocate recharge energy to the cheapest non-peak landed hours, within
+    contract-demand headroom. Returns ({hour: MWh}, unmet MWh)."""
+    alloc, rem = {}, need
+    for h in sorted((h for h in range(24) if h not in PEAK_HOURS),
+                    key=lambda h: prices[h] + oa):
+        room = min(max(0.0, contract - loads[h]), p_bess)
+        take = min(room, rem)
+        if take > 1e-9:
+            alloc[h] = take
+            rem -= take
+        if rem <= 1e-9:
+            break
+    return alloc, rem
+
+
+def render_sizing(inp: dict, day_key: str) -> None:
+    section_title("Module 00 · Sizing",
+                  "How big a battery does peak-hour replacement actually need?")
+    st.markdown(
+        f"<div style='font-size:13px;color:{T['ink_soft']};margin-bottom:8px;'>"
+        "MSEDCL ToD peak runs <b>17:00–24:00 (7 hours, +20%)</b>. The battery must serve "
+        "that window <i>and</i> recharge through whatever contract-demand headroom is left "
+        "in the other 17 hours — both constraints are checked below.</div>",
+        unsafe_allow_html=True)
+
+    c = st.columns(4)
+    contract = c[0].number_input("Contract demand (MW)", 1.0, 500.0, 10.0, 0.5)
+    night_load = c[1].number_input("Night load 00–06 (MW)", 0.0, 500.0, 5.0, 0.5)
+    day_load = c[2].number_input("Day load 06–17 (MW)", 0.0, 500.0, 7.0, 0.5)
+    eve_load = c[3].number_input("Evening load 17–24 (MW)", 0.0, 500.0, 9.0, 0.5)
+    c = st.columns(4)
+    coverage = c[0].slider("Peak coverage target (%)", 10, 100, 100, 5,
+                           help="Share of peak-window consumption the BESS should serve") / 100
+    dod = c[1].number_input("Usable DoD (%)", 70.0, 100.0, 90.0, 1.0,
+                            help="Depth of discharge — usable share of nameplate energy") / 100
+    margin = c[2].number_input("Degradation margin (%)", 0.0, 30.0, 10.0, 1.0,
+                               help="Oversizing so the pack still covers peak at end of design life") / 100
+    c[3].markdown(f"<div style='font-size:11.5px;color:{T['ink_soft']};padding-top:26px;'>"
+                  f"Round-trip eff. {inp['rte']:g}% and capex ₹{inp['capex_rate']:g} Cr/MWh "
+                  "come from the sidebar.</div>", unsafe_allow_html=True)
+
+    block_loads = [night_load] * 6 + [day_load] * 11 + [eve_load] * 7
+    with st.expander("Edit the 24-hour load profile (hour-by-hour)"):
+        prof_df = pd.DataFrame({"Hour": [f"{h:02d}:00" for h in range(24)],
+                                "Load (MW)": block_loads})
+        edited = st.data_editor(
+            prof_df, hide_index=True, disabled=["Hour"], height=300,
+            key=f"profile_{night_load}_{day_load}_{eve_load}",
+            column_config={"Load (MW)": st.column_config.NumberColumn(min_value=0.0, step=0.5)},
+        )
+        loads = edited["Load (MW)"].astype(float).clip(lower=0).tolist()
+
+    rte_frac = inp["rte"] / 100
+
+    over = [h for h in range(24) if loads[h] > contract + 1e-9]
+    if over:
+        st.warning(f"Load exceeds contract demand in {len(over)} hour(s) — "
+                   "sizing caps the served load at contract demand.")
+
+    max_cov = max_feasible_coverage(loads, contract, rte_frac, dod, margin)
+    eff_cov = min(coverage, max_cov)
+    s = size_bess(loads, contract, eff_cov, rte_frac, dod, margin)
+
+    if s["e_usable"] < 1e-9:
+        st.info("No peak-window load to serve — set an evening load above zero.")
+        return
+
+    if coverage > max_cov + 1e-9:
+        st.warning(
+            f"**{coverage:.0%} peak coverage can't recharge within your {contract:g} MW contract.** "
+            f"Serving the full window needs ≈ {coverage * sum(min(loads[h], contract) for h in PEAK_HOURS) / rte_frac:.0f} MWh "
+            f"back into the battery, but the non-peak headroom only admits {s['recharge_avail']:.0f} MWh. "
+            f"Recommendation below uses the maximum feasible coverage: **{max_cov:.0%}**. "
+            "To go higher: raise contract demand, shed day load, or add on-site solar charging."
+        )
+    else:
+        st.success(f"**{eff_cov:.0%} peak coverage is feasible** — recharge needs "
+                   f"{s['recharge_need']:.0f} MWh vs {s['recharge_avail']:.0f} MWh of "
+                   "non-peak headroom under the contract.")
+
+    p_sugg = math.ceil(s["p_req"] * 2) / 2
+    e_sugg = math.ceil(s["e_nameplate"])
+    capex = e_sugg * inp["capex_rate"] * 1.05
+
+    prices = PRICE_DAYS[day_key]["prices"]
+    tariff_peak = inp["base_tariff"] * inp["peak_mult"]
+    alloc, unmet = plan_charge(loads, contract, p_sugg, s["recharge_need"], prices, inp["oa"])
+    charge_cost = sum(mwh * 1000 * (prices[h] + inp["oa"]) for h, mwh in alloc.items()) / 1e5
+    avoided = s["e_usable"] * 1000 * tariff_peak / 1e5
+    saving_yr = (avoided - charge_cost) * inp["op_days"] / 100  # ₹ Cr
+
+    kpi_row([
+        ("Suggested power", f"{p_sugg:g} MW", "max BESS output in the peak window", None),
+        ("Suggested energy", f"{e_sugg:g} MWh",
+         f"{s['e_usable']:.0f} MWh usable ÷ {dod:.0%} DoD ÷ {1 - margin:.0%} EoL", None),
+        ("Duration", f"{e_sugg / p_sugg:.1f} h", "vs 7-h MSEDCL peak window", None),
+        ("Coverage sized for", f"{eff_cov:.0%}", "of 17:00–24:00 consumption", None),
+        ("Indicative capex", fmt_cr(capex), f"@ ₹{inp['capex_rate']:g} Cr/MWh + 5% contingency", None),
+        ("Indicative saving", f"₹{saving_yr:.1f} Cr/yr",
+         f"peak tariff ₹{tariff_peak:.2f} vs exchange charging", "good"),
+    ])
+
+    # 24-h picture: grid draw, BESS serve, BESS charging, contract line
+    st.markdown("")
+    hours = list(range(24))
+    grid_to_load = [loads[h] - s["served"].get(h, 0.0) for h in hours]
+    bess_serve = [s["served"].get(h, 0.0) for h in hours]
+    bess_charge = [alloc.get(h, 0.0) for h in hours]
+
+    fig = go.Figure()
+    add_bands(fig)
+    fig.add_trace(go.Bar(x=hours, y=grid_to_load, name="Grid → load",
+                         marker=dict(color=T["mcp"], line_width=0),
+                         hovertemplate="%{x:02d}:00 · %{y:.1f} MW from grid<extra>Grid → load</extra>"))
+    fig.add_trace(go.Bar(x=hours, y=bess_charge, name="BESS charging (grid draw)",
+                         marker=dict(color=T["charge"], line_width=0),
+                         hovertemplate="%{x:02d}:00 · %{y:.1f} MW charging<extra>BESS charging</extra>"))
+    fig.add_trace(go.Bar(x=hours, y=bess_serve, name="BESS → load (peak shaved)",
+                         marker=dict(color=T["discharge"], line_width=0),
+                         hovertemplate="%{x:02d}:00 · %{y:.1f} MW from BESS<extra>BESS → load</extra>"))
+    fig.add_hline(y=contract, line=dict(color="#C0392B", dash="6px 3px", width=1.5),
+                  annotation_text=f"contract {contract:g} MW",
+                  annotation_font=dict(size=11, color="#C0392B"))
+    fig.add_trace(go.Scatter(x=hours, y=loads, name="Plant load",
+                             line=dict(color=T["ink"], width=1.6, shape="hv"), mode="lines",
+                             hovertemplate="%{x:02d}:00 · %{y:.1f} MW load<extra>Plant load</extra>"))
+    fig.update_layout(
+        **BASE_LAYOUT, height=340, barmode="stack", bargap=0.25,
+        title=dict(text="Where the megawatts flow — grid draw stays under contract, peak turns ember",
+                   font_size=14, x=0.01),
+        xaxis=dict(tickmode="array", tickvals=list(range(0, 24, 2)),
+                   ticktext=[f"{h:02d}" for h in range(0, 24, 2)],
+                   showgrid=False, zeroline=False, title_text="hour of day"),
+        yaxis=dict(gridcolor=T["line"], zeroline=False, title_text="MW"),
+    )
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    st.caption("Charging is placed in the cheapest non-peak exchange hours that fit under the "
+               "contract-demand line. Shaded bands — blue: normal (00–09) · amber: solar (09–17) "
+               "· red: MSEDCL ToD peak (17–24).")
+
+    def _apply():
+        st.session_state["P"] = float(p_sugg)
+        st.session_state["E"] = float(e_sugg)
+
+    st.button(f"Apply {p_sugg:g} MW / {e_sugg:g} MWh to modules 01 · 02",
+              on_click=_apply, type="primary")
+    st.caption("Sets Power and Energy in the sidebar — dispatch and revenue recompute instantly.")
+
+
+# ------------------------------------------------------------------
 # Module 1 — Dispatch scheduler
 # ------------------------------------------------------------------
 def render_dispatch(inp: dict, day_key: str, dispatch: dict) -> None:
@@ -292,7 +509,7 @@ def render_dispatch(inp: dict, day_key: str, dispatch: dict) -> None:
         ann.update(font_size=12, x=0.01, xanchor="left")
     st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
     st.caption(
-        "Shaded bands — blue: night off-peak · amber: solar hours · red: ToD peak. "
+        "Shaded bands — blue: normal (00–09) · amber: solar (09–17) · red: MSEDCL ToD peak (17–24). "
         f"Price day: **{PRICE_DAYS[day_key]['label']}**."
     )
 
@@ -463,18 +680,32 @@ with st.sidebar:
 
     st.subheader("Battery")
     c1, c2 = st.columns(2)
-    P = c1.number_input("Power (MW)", 1.0, 500.0, 10.0, 1.0)
-    E = c2.number_input("Energy (MWh)", 1.0, 2000.0, 20.0, 1.0)
+    P = c1.number_input("Power (MW)", 1.0, 500.0, 10.0, 1.0, key="P")
+    E = c2.number_input("Energy (MWh)", 1.0, 2000.0, 20.0, 1.0, key="E")
     rte = c1.number_input("Round-trip eff. (%)", 50.0, 100.0, 88.0, 0.5)
     cycles = c2.number_input("Cycles / day", 1, 2, 2)
 
-    st.subheader("Market & tariff")
-    oa = st.number_input("Open-access adders (₹/kWh)", 0.0, 5.0, 1.3, 0.1,
-                         help="Transmission + wheeling + cross-subsidy surcharge etc. on exchange power")
-    base_tariff = st.number_input("Base grid tariff (₹/kWh)", 1.0, 20.0, 8.0, 0.1)
+    st.subheader("Market & tariff — MSEDCL (Maharashtra)")
+    oa = st.number_input(
+        "Open-access adders (₹/kWh)", 0.0, 8.0, MSEDCL["oa_33kv"], 0.1,
+        help="MSEDCL 33 kV: STU ₹0.52 + wheeling ₹0.81 + CSS ₹2.07 + green cess ₹0.25 "
+             "≈ ₹3.65/kWh. At 132/220 kV (no wheeling) ≈ ₹2.84. Wheeling loss 7.5% "
+             "in kind not modelled — add it here if needed.")
+    base_tariff = st.number_input("Base energy charge (₹/kWh)", 1.0, 20.0,
+                                  MSEDCL["base_tariff"], 0.1,
+                                  help="MSEDCL HT industrial energy charge, FY2026-27 order")
+
+    def _season_change():
+        st.session_state["off_mult"] = (
+            MSEDCL["solar_mult_summer"]
+            if st.session_state["season"].startswith("Apr") else MSEDCL["solar_mult_winter"])
+
+    st.selectbox("ToD season", ["Apr–Sep (solar −15%)", "Oct–Mar (solar −25%)"],
+                 key="season", on_change=_season_change)
     c1, c2 = st.columns(2)
-    peak_mult = c1.number_input("ToD peak ×", 1.0, 2.0, 1.25, 0.05)
-    off_mult = c2.number_input("ToD off-peak ×", 0.5, 1.0, 0.8, 0.05)
+    peak_mult = c1.number_input("ToD peak × (17–24 h)", 1.0, 2.0, MSEDCL["peak_mult"], 0.05)
+    off_mult = c2.number_input("ToD solar × (09–17 h)", 0.5, 1.0,
+                               MSEDCL["solar_mult_summer"], 0.05, key="off_mult")
 
     st.subheader("Financials")
     c1, c2 = st.columns(2)
@@ -501,11 +732,14 @@ st.markdown(f"""
 <h1 style="font-size:27px;font-weight:800;margin:0 0 2px;">
   Charge on the exchange. Discharge past your tariff.</h1>
 <div style="font-size:13px;color:{T['ink_soft']};margin-bottom:6px;">
-  Behind-the-meter battery arbitrage for an Indian industrial consumer — exchange
-  purchase at solar-hour prices, discharge against the discom ToD tariff.</div>
+  Behind-the-meter battery arbitrage for a Maharashtra (MSEDCL) industrial consumer —
+  exchange purchase at solar-hour prices, discharge against the discom ToD tariff.</div>
 """, unsafe_allow_html=True)
 
-tab1, tab2 = st.tabs(["**01 · Dispatch schedule**", "**02 · Revenue model**"])
+tab0, tab1, tab2 = st.tabs(["**00 · BESS sizing**", "**01 · Dispatch schedule**",
+                            "**02 · Revenue model**"])
+with tab0:
+    render_sizing(inp, day_key)
 with tab1:
     render_dispatch(inp, day_key, dispatch)
 with tab2:
