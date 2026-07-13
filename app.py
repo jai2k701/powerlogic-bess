@@ -71,6 +71,12 @@ MSEDCL = {
     "oa_ehv": 2.84,          # 132/220 kV: no wheeling charge
 }
 
+# 5 MWh container build-up (user's "BESS 5 MWH Container Calculation" sheet):
+# 3.2 V / 314 Ah LFP cell → 13 cells (S) = module → 4 modules (S) = pack
+# → 8 packs (S) = rack (1331.2 V, 418 kWh) → 12 racks (P) = container. 4992 cells, 52S1P.
+CELL_V, CELL_AH = 3.2, 314
+CONTAINER_MWH = CELL_V * CELL_AH * 13 * 4 * 8 * 12 / 1e6   # 5.016 MWh nameplate
+
 # Shaded x-bands on the 24-h charts: (x0, x1, fill)
 BANDS = [
     (-0.5, 8.5, T["night"]),
@@ -368,7 +374,9 @@ def render_sizing(inp: dict, day_key: str) -> None:
 
     p_sugg = math.ceil(s["p_req"] * 2) / 2
     e_sugg = math.ceil(s["e_nameplate"])
-    capex = e_sugg * inp["capex_rate"] * 1.05
+    n_cont = math.ceil(e_sugg / CONTAINER_MWH)
+    e_installed = round(n_cont * CONTAINER_MWH, 1)
+    capex = e_installed * inp["capex_rate"] * 1.05
 
     prices = PRICE_DAYS[day_key]["prices"]
     tariff_peak = inp["base_tariff"] * inp["peak_mult"]
@@ -379,14 +387,22 @@ def render_sizing(inp: dict, day_key: str) -> None:
 
     kpi_row([
         ("Suggested power", f"{p_sugg:g} MW", "max BESS output in the peak window", None),
-        ("Suggested energy", f"{e_sugg:g} MWh",
+        ("Energy needed", f"{e_sugg:g} MWh",
          f"{s['e_usable']:.0f} MWh usable ÷ {dod:.0%} DoD ÷ {1 - margin:.0%} EoL", None),
-        ("Duration", f"{e_sugg / p_sugg:.1f} h", "vs 7-h MSEDCL peak window", None),
+        ("Containers", f"{n_cont} × 5 MWh",
+         f"{CONTAINER_MWH:.2f} MWh each → {e_installed:g} MWh installed", None),
+        ("Duration", f"{e_installed / p_sugg:.1f} h", "installed, vs 7-h MSEDCL peak window", None),
         ("Coverage sized for", f"{eff_cov:.0%}", "of 17:00–24:00 consumption", None),
-        ("Indicative capex", fmt_cr(capex), f"@ ₹{inp['capex_rate']:g} Cr/MWh + 5% contingency", None),
+        ("Indicative capex", fmt_cr(capex), f"on {e_installed:g} MWh installed, + 5% contingency", None),
         ("Indicative saving", f"₹{saving_yr:.1f} Cr/yr",
          f"peak tariff ₹{tariff_peak:.2f} vs exchange charging", "good"),
     ])
+    st.caption(
+        f"Container spec (from the 5 MWh container calculation): 3.2 V / {CELL_AH} Ah LFP cell → "
+        "13S cells = module → 4S modules = pack → 8S packs = rack (1,331 V, 418 kWh) → "
+        f"12P racks = container ({CONTAINER_MWH * 1000:,.0f} kWh, 4,992 cells, 52S1P). "
+        "Alternate 104S1P HV design: 8S modules/pack, 6 racks — same energy."
+    )
 
     # 24-h picture: grid draw, BESS serve, BESS charging, contract line
     st.markdown("")
@@ -428,9 +444,9 @@ def render_sizing(inp: dict, day_key: str) -> None:
 
     def _apply():
         st.session_state["P"] = float(p_sugg)
-        st.session_state["E"] = float(e_sugg)
+        st.session_state["E"] = float(e_installed)
 
-    st.button(f"Apply {p_sugg:g} MW / {e_sugg:g} MWh to modules 01 · 02",
+    st.button(f"Apply {p_sugg:g} MW / {e_installed:g} MWh ({n_cont} containers) to modules 01 · 02",
               on_click=_apply, type="primary")
     st.caption("Sets Power and Energy in the sidebar — dispatch and revenue recompute instantly.")
 
