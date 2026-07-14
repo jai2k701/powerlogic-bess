@@ -7,7 +7,9 @@ Module 02 · Revenue model — the BD savings case: arbitrage + demand charge
 reduction + diesel genset displacement, with payback and 12-year IRR.
 """
 
+import io
 import math
+from datetime import date, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -99,6 +101,25 @@ BANDS = [
 def fmt_lakh(v: float) -> str:
     """₹ lakh → '₹x.xx L' or '₹x.xx Cr' above 100 L."""
     return f"₹{v / 100:.2f} Cr" if v >= 100 else f"₹{v:.2f} L"
+
+
+def block_times(b: int) -> tuple[str, str]:
+    """RLDC block b (1..96) → ('HH:MM', 'HH:MM'); block 96 ends at 24:00."""
+    m0 = (b - 1) * 15
+    m1 = b * 15
+    return f"{m0 // 60:02d}:{m0 % 60:02d}", "24:00" if b == 96 else f"{m1 // 60:02d}:{m1 % 60:02d}"
+
+
+def download_pair(df: pd.DataFrame, stem: str, label: str) -> None:
+    """CSV + XLSX download buttons for a schedule dataframe."""
+    c1, c2 = st.columns(2)
+    c1.download_button(f"⬇ {label} (CSV)", df.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{stem}.csv", mime="text/csv")
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        df.to_excel(xw, index=False, sheet_name="96_blocks")
+    c2.download_button(f"⬇ {label} (Excel)", buf.getvalue(), file_name=f"{stem}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 def fmt_cr(v: float) -> str:
@@ -545,6 +566,27 @@ def render_sizing(inp: dict, day_key: str) -> None:
                "contract-demand line. Shaded bands — blue: normal (00–09) · amber: solar (09–17) "
                "· red: MSEDCL ToD peak (17–24).")
 
+    st.markdown("**15-minute block profile** — sizing case as 96 RLDC-format time blocks")
+    recs = []
+    for b in range(1, 97):
+        h = (b - 1) // 4
+        t0, t1 = block_times(b)
+        serve = s["served"].get(h, 0.0)
+        chg = alloc.get(h, 0.0)
+        recs.append({
+            "Block No": b,
+            "Time From": t0,
+            "Time To": t1,
+            "Plant Load (MW)": round(loads[h], 2),
+            "BESS Discharge (MW)": round(serve, 2),
+            "BESS Charge (MW)": round(chg, 2),
+            "Grid Drawal (MW)": round(loads[h] - serve + chg, 2),
+            "Contract Demand (MW)": contract,
+            "ToD Window": "Peak" if h in PEAK_HOURS else "Solar" if h in OFFPEAK_HOURS else "Normal",
+        })
+    prof_blocks = pd.DataFrame(recs)
+    download_pair(prof_blocks, "BESS_sizing_load_96blocks", "96-block load & BESS profile")
+
     def _apply():
         st.session_state["P"] = float(p_sugg)
         st.session_state["E"] = float(e_installed)
@@ -654,6 +696,49 @@ def render_dispatch(inp: dict, day_key: str, dispatch: dict) -> None:
         "Prices are representative IEX day-ahead shapes, not live data. Actual scheduling runs on "
         "15-minute blocks with D-1 bidding at 10:00 and revisions via RTM. Open-access adders bundle "
         "transmission, wheeling, and other applicable charges — set them to your state's values."
+    )
+
+    # ---- RLDC / SLDC / REMC submission: 96 × 15-minute blocks --------------
+    st.markdown("**RLDC / SLDC / REMC submission — 96 × 15-minute block schedule**")
+    c1, c2 = st.columns([1, 3])
+    sched_date = c1.date_input("Schedule date (D-1)", value=date.today() + timedelta(days=1),
+                               help="Day-ahead schedules are submitted by ~10:00 for the next day")
+    c2.markdown(
+        f"<div style='font-size:11.5px;color:{T['ink_soft']};padding-top:30px;'>"
+        "Block 1 = 00:00–00:15 … block 96 = 23:45–24:00. Drawal (charging) is positive, "
+        "behind-the-meter discharge negative — map columns to your REMC/SLDC portal template.</div>",
+        unsafe_allow_html=True)
+
+    rows = dispatch["rows"]
+    recs = []
+    for b in range(1, 97):
+        h = (b - 1) // 4
+        r = rows[h]
+        t0, t1 = block_times(b)
+        soc_start = rows[h - 1]["soc_pct"] if h > 0 else 0.0
+        soc_blk = soc_start + (r["soc_pct"] - soc_start) * ((b - 1) % 4 + 1) / 4
+        recs.append({
+            "Date": sched_date.strftime("%d-%m-%Y"),
+            "Block No": b,
+            "Time From": t0,
+            "Time To": t1,
+            "IEX MCP (Rs/kWh)": r["mcp"],
+            "Landed Cost (Rs/kWh)": r["landed"],
+            "Charge / Exchange Drawal (MW)": round(r["charge"], 2),
+            "BTM Discharge (MW)": round(r["discharge"], 2),
+            "Net BESS Schedule (MW)": round(r["charge"] - r["discharge"], 2),
+            "SoC (%)": round(soc_blk, 1),
+            "Action": r["action"],
+        })
+    blocks_df = pd.DataFrame(recs)
+    download_pair(blocks_df, f"BESS_dispatch_96blocks_{sched_date.strftime('%Y%m%d')}",
+                  "96-block dispatch schedule")
+    with st.expander("Preview the 96-block schedule"):
+        st.dataframe(blocks_df, hide_index=True, width="stretch", height=320)
+    st.caption(
+        "The 'Charge / Exchange Drawal' column is the open-access drawal quantum to schedule "
+        "block-wise (matches the DAM buy). Discharge is consumed behind the meter — it reduces "
+        "your discom drawal but is not an injection schedule."
     )
 
 
