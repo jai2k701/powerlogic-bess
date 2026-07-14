@@ -77,6 +77,17 @@ MSEDCL = {
 CELL_V, CELL_AH = 3.2, 314
 CONTAINER_MWH = CELL_V * CELL_AH * 13 * 4 * 8 * 12 / 1e6   # 5.016 MWh nameplate
 
+# PCS building blocks commonly quoted in the Indian utility/C&I market (grid-tied,
+# 1500 V DC class). The 5 MWh container is a 0.5C product — 2.5 MW skid is its pair.
+PCS_UNITS = {
+    "2.5 MW MV skid — standard pair for 5 MWh container (0.5C)": 2.5,
+    "3.45 MW central inverter": 3.45,
+    "5.0 MW MV skid": 5.0,
+    "1.25 MW compact PCS": 1.25,
+    "250 kW string PCS": 0.25,
+}
+CONTAINER_C_RATE = 0.5   # max continuous C-rate of the 314 Ah / 5 MWh container class
+
 # Shaded x-bands on the 24-h charts: (x0, x1, fill)
 BANDS = [
     (-0.5, 8.5, T["night"]),
@@ -402,6 +413,98 @@ def render_sizing(inp: dict, day_key: str) -> None:
         "13S cells = module → 4S modules = pack → 8S packs = rack (1,331 V, 418 kWh) → "
         f"12P racks = container ({CONTAINER_MWH * 1000:,.0f} kWh, 4,992 cells, 52S1P). "
         "Alternate 104S1P HV design: 8S modules/pack, 6 racks — same energy."
+    )
+
+    # ---- PCS configuration ------------------------------------------------
+    st.markdown("**PCS configuration** — market-available unit sizes (1500 V DC class)")
+    c = st.columns([3, 1, 2])
+    pcs_label = c[0].selectbox("PCS building block", list(PCS_UNITS),
+                               help="Representative commercially available ratings — "
+                                    "central skids and string PCS as marketed in India")
+    pcs_unit = PCS_UNITS[pcs_label]
+    n1_red = c[1].checkbox("N+1", value=False, help="One redundant PCS unit")
+    n_pcs = math.ceil(p_sugg / pcs_unit) + (1 if n1_red else 0)
+    pcs_mw = n_pcs * pcs_unit
+    c_rate = pcs_mw / e_installed if e_installed else 0.0
+    c[2].markdown(
+        f"<div style='font-size:11.5px;color:{T['ink_soft']};padding-top:26px;'>"
+        f"Duty: {p_sugg:g} MW discharge into the peak window.</div>", unsafe_allow_html=True)
+
+    kpi_row([
+        ("PCS units", f"{n_pcs} × {pcs_unit:g} MW",
+         f"{pcs_mw:g} MW installed{' (incl. N+1)' if n1_red else ''} vs {p_sugg:g} MW duty", None),
+        ("System C-rate", f"{c_rate:.2f}C",
+         f"PCS {pcs_mw:g} MW ÷ {e_installed:g} MWh installed",
+         "bad" if c_rate > CONTAINER_C_RATE + 1e-9 else None),
+        ("PCS : container ratio", f"{n_pcs} : {n_cont}",
+         "market standard is one 2.5 MW skid per 2 × 5 MWh containers", None),
+    ])
+    if c_rate > CONTAINER_C_RATE + 1e-9:
+        st.warning(f"PCS power implies {c_rate:.2f}C — above the {CONTAINER_C_RATE:.1f}C "
+                   "continuous rating of the 314 Ah / 5 MWh container class. Add containers "
+                   "or choose smaller PCS blocks.")
+
+    # ---- Charging-cycle validation ----------------------------------------
+    st.markdown("**Charging-cycle validation** — one cycle, two, or undersized?")
+    usable_cycle = e_installed * dod
+    req_day = s["e_usable"]
+    cycles_req = req_day / usable_cycle if usable_cycle else 0.0
+    charge_need = req_day / rte_frac
+    solar_cap = sum(min(pcs_mw, max(0.0, contract - loads[h])) for h in range(9, 17))
+    night_cap = sum(min(pcs_mw, max(0.0, contract - loads[h])) for h in range(0, 9))
+    n_one_cycle = math.ceil(req_day / dod / CONTAINER_MWH)
+
+    kpi_row([
+        ("Usable per cycle", f"{usable_cycle:.1f} MWh", f"{e_installed:g} MWh × {dod:.0%} DoD", None),
+        ("Peak demand / day", f"{req_day:.1f} MWh", "to serve 17:00–24:00", None),
+        ("Cycles implied", f"{cycles_req:.2f} / day",
+         "LFP warranty ≈ 6,000–8,000 cycles: 1/day ≈ 18+ yrs, 2/day ≈ 9–10 yrs", None),
+        ("Recharge need", f"{charge_need:.1f} MWh/day",
+         f"windows: solar {solar_cap:.0f} MWh · night {night_cap:.0f} MWh", None),
+    ])
+
+    if cycles_req <= 1.0 + 1e-9:
+        if charge_need <= solar_cap + 1e-9:
+            st.success(
+                f"**ONE daily cycle is sufficient — the standard Indian BTM pattern.** "
+                f"The full {charge_need:.0f} MWh recharge fits inside the solar window "
+                f"(09:00–17:00, {solar_cap:.0f} MWh available), where IEX DAM clears at its "
+                f"daily floor (₹2.2–3.1 on the modelled shapes). Discharge 17:00–24:00."
+            )
+        else:
+            st.success(
+                f"**ONE daily cycle is sufficient**, but the {charge_need:.0f} MWh recharge "
+                f"exceeds the solar-window capability ({solar_cap:.0f} MWh at this PCS/headroom) — "
+                f"split it: {solar_cap:.0f} MWh in solar hours + "
+                f"{charge_need - solar_cap:.0f} MWh overnight (00:00–09:00, "
+                f"{night_cap:.0f} MWh available). Still one charge–discharge cycle per day."
+            )
+    elif cycles_req <= 2.0:
+        st.warning(
+            f"**TWO cycles per day would be needed** ({cycles_req:.2f}) — but MSEDCL has a "
+            "single evening peak (17:00–24:00), so there is no second premium discharge window "
+            "for peak replacement. Realistic options: "
+            f"**add {n_one_cycle - n_cont} containers** (→ {n_one_cycle} total) to serve the peak "
+            "in one cycle, or run the second cycle as thin-margin arbitrage against the normal "
+            "tariff / RTM morning ramp (06:00–09:00) — states with dual ToD peaks "
+            "(e.g., UP 05–10 + evening, Uttarakhand morning + evening) genuinely support 2 cycles."
+        )
+    else:
+        st.error(
+            f"**UNDERSIZED — {cycles_req:.1f} cycles/day implied**, and more than 2 cycles/day "
+            "is not physically available against a single 7-hour evening peak. "
+            f"Add {n_one_cycle - n_cont} containers (→ {n_one_cycle} × 5 MWh) for one-cycle "
+            "operation, or lower the coverage target."
+        )
+
+    n_two_cycle = math.ceil(req_day / 2 / dod / CONTAINER_MWH)
+    st.caption(
+        f"Cycle strategy vs fleet size — **1 cycle/day: {n_cont} containers** (the only real option "
+        f"under MSEDCL's single 17–24 h peak) · 2 cycles/day would need just {n_two_cycle} containers, "
+        "but requires a second premium discharge window: dual-peak ToD states (UP 17–23 + morning, "
+        "Uttarakhand 06–09 + 18–22) or RTM/DAM stacking. Against MSEDCL's normal tariff a second "
+        "cycle earns only ≈ ₹0.5–1.5/kWh delivered vs ₹3–4/kWh on the peak cycle — "
+        "it rarely pays for the extra degradation."
     )
 
     # 24-h picture: grid draw, BESS serve, BESS charging, contract line
