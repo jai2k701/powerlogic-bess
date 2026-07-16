@@ -8,6 +8,12 @@ against your discom ToD tariff.**
 
 **00 · BESS sizing** — for a Maharashtra (MSEDCL) industrial consumer who wants
 to replace ToD **peak-window (17:00–24:00, +20%) consumption** with a battery.
+Sizing follows the BESS reference-doc chain: meter demand ÷ external efficiency
+(transformer ~2% × transmission ~1.5% × auxiliary ~1%) ÷ (SoC window × SoH) =
+nameplate; whole 5 MWh containers (energy AND 0.25C power check); PCS blocks
+(1 block = 4 containers + 1 PCS, 20% margin); charging-cycle validation
+(one-cycle vs two-cycle vs undersized) and the energy-reality line
+(grid purchase → cells → meter, overall system RTE ≈ 80–86%).
 Editable contract demand, night / day / evening block loads (plus an
 hour-by-hour editable 24-h profile). The module sizes power and energy for the
 peak window **and checks recharge feasibility**: the battery must refill through

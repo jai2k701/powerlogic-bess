@@ -88,7 +88,7 @@ PCS_UNITS = {
     "1.25 MW compact PCS": 1.25,
     "250 kW string PCS": 0.25,
 }
-CONTAINER_C_RATE = 0.5   # max continuous C-rate of the 314 Ah / 5 MWh container class
+# Container C-rate is an input in Module 00 (doc reference: 0.25C → 1.25 MW per container)
 
 # Shaded x-bands on the 24-h charts: (x0, x1, fill)
 BANDS = [
@@ -296,29 +296,35 @@ BASE_LAYOUT = dict(
 # ------------------------------------------------------------------
 # Module 0 — BESS sizing (MSEDCL peak replacement)
 # ------------------------------------------------------------------
-def size_bess(loads, contract, coverage, rte_frac, dod_frac, margin_frac):
-    """Size a BESS to serve `coverage` of peak-window load, checking that the
-    non-peak contract-demand headroom can actually recharge it."""
+def size_bess(loads, contract, coverage, rte_frac, usable_frac, eta_ext):
+    """Size a BESS to serve `coverage` of peak-window load.
+
+    Sizing chain per the BESS reference doc: meter-side demand ÷ external
+    efficiency (transformer · transmission · auxiliary) = battery-side energy;
+    ÷ (SoC window × SoH) = installed nameplate. Recharge is grossed up by the
+    battery RTE and the external losses again (grid → cells), and must fit the
+    non-peak contract-demand headroom."""
     served = {h: min(loads[h], contract) * coverage for h in PEAK_HOURS}
     p_req = max(served.values()) if served else 0.0
-    e_usable = sum(served.values())
-    e_nameplate = e_usable / dod_frac / (1 - margin_frac) if e_usable else 0.0
-    recharge_need = e_usable / rte_frac
+    e_usable = sum(served.values())                    # at the meter
+    e_batt = e_usable / eta_ext                        # cells must deliver this
+    e_nameplate = e_batt / usable_frac if e_batt else 0.0
+    recharge_need = e_batt / rte_frac / eta_ext        # bought from grid
     recharge_avail = sum(
         min(max(0.0, contract - loads[h]), p_req)
         for h in range(24) if h not in PEAK_HOURS
     )
     return {
         "served": served, "p_req": p_req, "e_usable": e_usable,
-        "e_nameplate": e_nameplate, "recharge_need": recharge_need,
-        "recharge_avail": recharge_avail,
+        "e_batt": e_batt, "e_nameplate": e_nameplate,
+        "recharge_need": recharge_need, "recharge_avail": recharge_avail,
         "feasible": recharge_need <= recharge_avail + 1e-9,
     }
 
 
-def max_feasible_coverage(loads, contract, rte_frac, dod_frac, margin_frac):
+def max_feasible_coverage(loads, contract, rte_frac, usable_frac, eta_ext):
     for c in range(100, 0, -1):
-        if size_bess(loads, contract, c / 100, rte_frac, dod_frac, margin_frac)["feasible"]:
+        if size_bess(loads, contract, c / 100, rte_frac, usable_frac, eta_ext)["feasible"]:
             return c / 100
     return 0.0
 
@@ -357,13 +363,34 @@ def render_sizing(inp: dict, day_key: str) -> None:
     c = st.columns(4)
     coverage = c[0].slider("Peak coverage target (%)", 10, 100, 100, 5,
                            help="Share of peak-window consumption the BESS should serve") / 100
-    dod = c[1].number_input("Usable DoD (%)", 70.0, 100.0, 90.0, 1.0,
-                            help="Depth of discharge — usable share of nameplate energy") / 100
-    margin = c[2].number_input("Degradation margin (%)", 0.0, 30.0, 10.0, 1.0,
-                               help="Oversizing so the pack still covers peak at end of design life") / 100
-    c[3].markdown(f"<div style='font-size:11.5px;color:{T['ink_soft']};padding-top:26px;'>"
-                  f"Round-trip eff. {inp['rte']:g}% and capex ₹{inp['capex_rate']:g} Cr/MWh "
-                  "come from the sidebar.</div>", unsafe_allow_html=True)
+    soc_min = c[1].number_input("SoC min (%)", 0.0, 30.0, 10.0, 1.0,
+                                help="Lower state-of-charge limit — buffer protecting cell health")
+    soc_max = c[2].number_input("SoC max (%)", 70.0, 100.0, 90.0, 1.0,
+                                help="Upper state-of-charge limit")
+    soh = c[3].number_input("SoH — design (%)", 70.0, 100.0, 90.0, 1.0,
+                            help="State of Health the sizing must still work at "
+                                 "(≈90% after 4,000 cycles per manufacturer data)") / 100
+    c = st.columns(4)
+    c_rate = c[0].number_input("Container C-rate", 0.1, 1.0, 0.25, 0.05,
+                               help="0.25C = 4-h product (1.25 MW per 5 MWh container, "
+                                    "per the reference doc); 0.5C = 2-h")
+    trf = c[1].number_input("Transformer loss (%)", 0.0, 5.0, 2.0, 0.5)
+    txl = c[2].number_input("Transmission/cable loss (%)", 0.0, 5.0, 1.5, 0.5)
+    aux = c[3].number_input("Standby & auxiliary (%)", 0.0, 5.0, 1.0, 0.5,
+                            help="HVAC, BMS, controls — % of throughput")
+
+    soc_window = (soc_max - soc_min) / 100
+    usable_frac = soc_window * soh
+    eta_ext = (1 - trf / 100) * (1 - txl / 100) * (1 - aux / 100)
+    overall_rte = (inp["rte"] / 100) * eta_ext ** 2
+    st.caption(
+        f"Usable SoC window = {soc_max:g}% − {soc_min:g}% = **{soc_window:.0%}** · usable fraction "
+        f"= window × SoH = **{usable_frac:.0%}** of nameplate · external efficiency "
+        f"(transformer × transmission × auxiliary) = **{eta_ext:.1%}** each way · "
+        f"**overall system RTE ≈ {overall_rte:.0%}** — every 1 MWh bought returns "
+        f"≈ {overall_rte:.2f} MWh at the meter. Battery RTE {inp['rte']:g}% and capex "
+        f"₹{inp['capex_rate']:g} Cr/MWh come from the sidebar."
+    )
 
     block_loads = [night_load] * 6 + [day_load] * 11 + [eve_load] * 7
     with st.expander("Edit the 24-hour load profile (hour-by-hour)"):
@@ -383,31 +410,37 @@ def render_sizing(inp: dict, day_key: str) -> None:
         st.warning(f"Load exceeds contract demand in {len(over)} hour(s) — "
                    "sizing caps the served load at contract demand.")
 
-    max_cov = max_feasible_coverage(loads, contract, rte_frac, dod, margin)
+    max_cov = max_feasible_coverage(loads, contract, rte_frac, usable_frac, eta_ext)
     eff_cov = min(coverage, max_cov)
-    s = size_bess(loads, contract, eff_cov, rte_frac, dod, margin)
+    s = size_bess(loads, contract, eff_cov, rte_frac, usable_frac, eta_ext)
 
     if s["e_usable"] < 1e-9:
         st.info("No peak-window load to serve — set an evening load above zero.")
         return
 
     if coverage > max_cov + 1e-9:
+        full_need = (coverage * sum(min(loads[h], contract) for h in PEAK_HOURS)
+                     / eta_ext / rte_frac / eta_ext)
         st.warning(
             f"**{coverage:.0%} peak coverage can't recharge within your {contract:g} MW contract.** "
-            f"Serving the full window needs ≈ {coverage * sum(min(loads[h], contract) for h in PEAK_HOURS) / rte_frac:.0f} MWh "
-            f"back into the battery, but the non-peak headroom only admits {s['recharge_avail']:.0f} MWh. "
+            f"Serving the full window needs ≈ {full_need:.0f} MWh bought from the grid "
+            "(after RTE and transformer/transmission/auxiliary losses), but the non-peak "
+            f"headroom only admits {s['recharge_avail']:.0f} MWh. "
             f"Recommendation below uses the maximum feasible coverage: **{max_cov:.0%}**. "
             "To go higher: raise contract demand, shed day load, or add on-site solar charging."
         )
     else:
-        st.success(f"**{eff_cov:.0%} peak coverage is feasible** — recharge needs "
-                   f"{s['recharge_need']:.0f} MWh vs {s['recharge_avail']:.0f} MWh of "
-                   "non-peak headroom under the contract.")
+        st.success(f"**{eff_cov:.0%} peak coverage is feasible** — grid recharge needs "
+                   f"{s['recharge_need']:.0f} MWh (incl. all losses) vs {s['recharge_avail']:.0f} MWh "
+                   "of non-peak headroom under the contract.")
 
     p_sugg = math.ceil(s["p_req"] * 2) / 2
     e_sugg = math.ceil(s["e_nameplate"])
-    n_cont = math.ceil(e_sugg / CONTAINER_MWH)
+    n_cont_e = math.ceil(e_sugg / CONTAINER_MWH)                     # energy-driven
+    n_cont_p = math.ceil(p_sugg / (c_rate * CONTAINER_MWH))          # power-driven (C-rate cap)
+    n_cont = max(n_cont_e, n_cont_p)
     e_installed = round(n_cont * CONTAINER_MWH, 1)
+    cont_mw = round(n_cont * c_rate * CONTAINER_MWH, 2)
     capex = e_installed * inp["capex_rate"] * 1.05
 
     prices = PRICE_DAYS[day_key]["prices"]
@@ -420,9 +453,9 @@ def render_sizing(inp: dict, day_key: str) -> None:
     kpi_row([
         ("Suggested power", f"{p_sugg:g} MW", "max BESS output in the peak window", None),
         ("Energy needed", f"{e_sugg:g} MWh",
-         f"{s['e_usable']:.0f} MWh usable ÷ {dod:.0%} DoD ÷ {1 - margin:.0%} EoL", None),
+         f"{s['e_usable']:.0f} at meter ÷ {eta_ext:.1%} ext ÷ {soc_window:.0%} SoC window ÷ {soh:.0%} SoH", None),
         ("Containers", f"{n_cont} × 5 MWh",
-         f"{CONTAINER_MWH:.2f} MWh each → {e_installed:g} MWh installed", None),
+         f"energy needs {n_cont_e}, C-rate needs {n_cont_p} → {e_installed:g} MWh / {cont_mw:g} MW installed", None),
         ("Duration", f"{e_installed / p_sugg:.1f} h", "installed, vs 7-h MSEDCL peak window", None),
         ("Coverage sized for", f"{eff_cov:.0%}", "of 17:00–24:00 consumption", None),
         ("Indicative capex", fmt_cr(capex), f"on {e_installed:g} MWh installed, + 5% contingency", None),
@@ -438,51 +471,66 @@ def render_sizing(inp: dict, day_key: str) -> None:
 
     # ---- PCS configuration ------------------------------------------------
     st.markdown("**PCS configuration** — market-available unit sizes (1500 V DC class)")
-    c = st.columns([3, 1, 2])
+    c = st.columns([3, 1, 1, 1])
     pcs_label = c[0].selectbox("PCS building block", list(PCS_UNITS),
                                help="Representative commercially available ratings — "
                                     "central skids and string PCS as marketed in India")
     pcs_unit = PCS_UNITS[pcs_label]
-    n1_red = c[1].checkbox("N+1", value=False, help="One redundant PCS unit")
-    n_pcs = math.ceil(p_sugg / pcs_unit) + (1 if n1_red else 0)
+    cont_per_pcs = c[1].number_input("Containers / PCS", 1, 8, 4,
+                                     help="Reference doc: 1 block = 4 containers + 1 PCS")
+    pcs_margin = c[2].number_input("PCS margin (%)", 0.0, 50.0, 20.0, 5.0,
+                                   help="Inverter oversizing over continuous duty "
+                                        "(reference doc uses 1.20×)") / 100
+    n1_red = c[3].checkbox("N+1", value=False, help="One redundant PCS unit")
+    n_pcs_pow = math.ceil(p_sugg * (1 + pcs_margin) / pcs_unit)   # method 2: power
+    n_pcs_blk = math.ceil(n_cont / cont_per_pcs)                  # method 1: containers/blocks
+    n_pcs = max(n_pcs_pow, n_pcs_blk) + (1 if n1_red else 0)
     pcs_mw = n_pcs * pcs_unit
-    c_rate = pcs_mw / e_installed if e_installed else 0.0
-    c[2].markdown(
-        f"<div style='font-size:11.5px;color:{T['ink_soft']};padding-top:26px;'>"
-        f"Duty: {p_sugg:g} MW discharge into the peak window.</div>", unsafe_allow_html=True)
+    sys_c_rate = pcs_mw / e_installed if e_installed else 0.0
 
     kpi_row([
         ("PCS units", f"{n_pcs} × {pcs_unit:g} MW",
-         f"{pcs_mw:g} MW installed{' (incl. N+1)' if n1_red else ''} vs {p_sugg:g} MW duty", None),
-        ("System C-rate", f"{c_rate:.2f}C",
-         f"PCS {pcs_mw:g} MW ÷ {e_installed:g} MWh installed",
-         "bad" if c_rate > CONTAINER_C_RATE + 1e-9 else None),
-        ("PCS : container ratio", f"{n_pcs} : {n_cont}",
-         "market standard is one 2.5 MW skid per 2 × 5 MWh containers", None),
+         f"power method {n_pcs_pow} (duty × {1 + pcs_margin:.2f}) · block method {n_pcs_blk}"
+         f"{' · +1 redundant' if n1_red else ''}", None),
+        ("PCS installed", f"{pcs_mw:g} MW", f"vs {p_sugg:g} MW duty into the peak window", None),
+        ("Blocks", f"{n_pcs_blk}", f"1 block = {cont_per_pcs} containers + 1 PCS (doc layout)", None),
+        ("System C-rate", f"{sys_c_rate:.2f}C",
+         f"PCS {pcs_mw:g} MW ÷ {e_installed:g} MWh · container fleet caps at "
+         f"{c_rate:.2f}C = {cont_mw:g} MW",
+         "bad" if sys_c_rate > c_rate + 1e-9 else None),
     ])
-    if c_rate > CONTAINER_C_RATE + 1e-9:
-        st.warning(f"PCS power implies {c_rate:.2f}C — above the {CONTAINER_C_RATE:.1f}C "
-                   "continuous rating of the 314 Ah / 5 MWh container class. Add containers "
-                   "or choose smaller PCS blocks.")
+    if sys_c_rate > c_rate + 1e-9:
+        st.warning(f"PCS power implies {sys_c_rate:.2f}C — above the {c_rate:.2f}C "
+                   "container rating. The batteries, not the PCS, set the real limit: "
+                   f"usable plant power is {cont_mw:g} MW. Add containers or reduce PCS.")
 
     # ---- Charging-cycle validation ----------------------------------------
     st.markdown("**Charging-cycle validation** — one cycle, two, or undersized?")
-    usable_cycle = e_installed * dod
-    req_day = s["e_usable"]
+    usable_cycle = e_installed * usable_frac
+    req_day = s["e_batt"]                       # battery-side energy per day
     cycles_req = req_day / usable_cycle if usable_cycle else 0.0
-    charge_need = req_day / rte_frac
-    solar_cap = sum(min(pcs_mw, max(0.0, contract - loads[h])) for h in range(9, 17))
-    night_cap = sum(min(pcs_mw, max(0.0, contract - loads[h])) for h in range(0, 9))
-    n_one_cycle = math.ceil(req_day / dod / CONTAINER_MWH)
+    charge_need = s["recharge_need"]            # bought from grid, incl. all losses
+    charge_mw_cap = min(pcs_mw, cont_mw)
+    solar_cap = sum(min(charge_mw_cap, max(0.0, contract - loads[h])) for h in range(9, 17))
+    night_cap = sum(min(charge_mw_cap, max(0.0, contract - loads[h])) for h in range(0, 9))
+    n_one_cycle = max(math.ceil(req_day / usable_frac / CONTAINER_MWH), n_cont_p)
 
     kpi_row([
-        ("Usable per cycle", f"{usable_cycle:.1f} MWh", f"{e_installed:g} MWh × {dod:.0%} DoD", None),
-        ("Peak demand / day", f"{req_day:.1f} MWh", "to serve 17:00–24:00", None),
+        ("Usable per cycle", f"{usable_cycle:.1f} MWh",
+         f"{e_installed:g} MWh × {soc_window:.0%} SoC window × {soh:.0%} SoH", None),
+        ("Battery duty / day", f"{req_day:.1f} MWh",
+         f"{s['e_usable']:.1f} MWh at meter ÷ {eta_ext:.1%} external losses", None),
         ("Cycles implied", f"{cycles_req:.2f} / day",
          "LFP warranty ≈ 6,000–8,000 cycles: 1/day ≈ 18+ yrs, 2/day ≈ 9–10 yrs", None),
-        ("Recharge need", f"{charge_need:.1f} MWh/day",
+        ("Grid purchase / day", f"{charge_need:.1f} MWh",
          f"windows: solar {solar_cap:.0f} MWh · night {night_cap:.0f} MWh", None),
     ])
+    st.caption(
+        f"Energy reality per day (doc method): buy **{charge_need:.1f} MWh** from the exchange → "
+        f"{req_day:.1f} MWh into cells (RTE {inp['rte']:g}%) → {s['e_usable']:.1f} MWh delivered "
+        f"at the meter after transformer/transmission/auxiliary — overall system RTE "
+        f"**{s['e_usable'] / charge_need:.0%}**."
+    )
 
     if cycles_req <= 1.0 + 1e-9:
         if charge_need <= solar_cap + 1e-9:
@@ -518,7 +566,7 @@ def render_sizing(inp: dict, day_key: str) -> None:
             "operation, or lower the coverage target."
         )
 
-    n_two_cycle = math.ceil(req_day / 2 / dod / CONTAINER_MWH)
+    n_two_cycle = math.ceil(req_day / 2 / usable_frac / CONTAINER_MWH)
     st.caption(
         f"Cycle strategy vs fleet size — **1 cycle/day: {n_cont} containers** (the only real option "
         f"under MSEDCL's single 17–24 h peak) · 2 cycles/day would need just {n_two_cycle} containers, "
